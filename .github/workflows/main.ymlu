@@ -1,0 +1,230 @@
+name: RDP
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      # ─────────────────────────────────────────────
+      # 1. LIBERAR ESPACIO Y MONTAR DISCO EXTRA
+      # ─────────────────────────────────────────────
+      - name: Free Up Space & Mount Extra Disk
+        run: |
+          Write-Host "=== Disk before cleanup ==="
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+
+          # Eliminar herramientas de CI que no necesitas (~6-8GB libres extra)
+          $toRemove = @(
+            "$env:SystemDrive\hostedtoolcache\windows\Ruby",
+            "$env:SystemDrive\hostedtoolcache\windows\go",
+            "$env:SystemDrive\hostedtoolcache\windows\Python",
+            "$env:ProgramFiles\dotnet",
+            "$env:ProgramFiles\MongoDB",
+            "$env:ProgramFiles\PostgreSQL",
+            "$env:ProgramFiles (x86)\Google\Chrome",
+            "$env:ProgramFiles\Mozilla Firefox"
+          )
+          foreach ($path in $toRemove) {
+            if (Test-Path $path) {
+              Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Removed: $path"
+            }
+          }
+
+          # Usar el disco D: que ya existe en runners (~70GB disponibles)
+          Write-Host "=== Disk D: info ==="
+          Get-PSDrive D -ErrorAction SilentlyContinue
+
+          # Crear un VHD de 100GB adicional montado como E:
+          $vhdPath = "D:\extra_disk.vhdx"
+          New-VHD -Path $vhdPath -SizeBytes 100GB -Dynamic -ErrorAction SilentlyContinue
+          Mount-VHD -Path $vhdPath
+          $disk = Get-Disk | Where-Object { $_.OperationalStatus -eq 'Online' -and $_.PartitionStyle -eq 'RAW' } | Select-Object -Last 1
+          if ($disk) {
+            Initialize-Disk -Number $disk.Number -PartitionStyle MBR -PassThru |
+              New-Partition -AssignDriveLetter -UseMaximumSize |
+              Format-Volume -FileSystem NTFS -NewFileSystemLabel "ExtraDisk" -Confirm:$false
+          }
+
+          Write-Host "=== Disk after setup ==="
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+
+          # Exportar variables de rutas útiles
+          echo "EXTRA_DISK=E:" >> $env:GITHUB_ENV
+          echo "STORAGE_ROOT=D:\storage" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force -Path "D:\storage" | Out-Null
+
+      # ─────────────────────────────────────────────
+      # 2. INSTALAR MESA3D (OpenGL SOFTWARE RENDERER)
+      # ─────────────────────────────────────────────
+      - name: Install Mesa3D OpenGL (Software GPU)
+        run: |
+          # Mesa3D provee OpenGL 3.x via software rendering (llvmpipe/softpipe)
+          # Permite ejecutar apps OpenGL sin GPU física
+          $mesaUrl = "https://github.com/pal1000/mesa-dist-win/releases/download/24.3.4/mesa3d-24.3.4-release-mingw.7z"
+          $sevenZipUrl = "https://www.7-zip.org/a/7zr.exe"
+          
+          # Descargar 7zr para extraer
+          Invoke-WebRequest -Uri $sevenZipUrl -OutFile "$env:TEMP\7zr.exe" -UseBasicParsing
+          
+          # Descargar Mesa3D
+          Write-Host "Downloading Mesa3D..."
+          Invoke-WebRequest -Uri $mesaUrl -OutFile "$env:TEMP\mesa3d.7z" -UseBasicParsing
+          
+          # Extraer
+          $mesaDir = "C:\mesa3d"
+          New-Item -ItemType Directory -Force -Path $mesaDir | Out-Null
+          & "$env:TEMP\7zr.exe" x "$env:TEMP\mesa3d.7z" -o"$mesaDir" -y | Out-Null
+          
+          # Instalar Mesa system-wide (x64)
+          $installScript = Get-ChildItem -Path $mesaDir -Filter "systemwidedeploy.cmd" -Recurse | Select-Object -First 1
+          if ($installScript) {
+            Write-Host "Installing Mesa3D system-wide..."
+            & cmd /c "`"$($installScript.FullName)`" x64"
+          } else {
+            # Instalación manual: copiar DLLs a System32
+            $x64dir = Get-ChildItem -Path $mesaDir -Filter "x64" -Recurse -Directory | Select-Object -First 1
+            if ($x64dir) {
+              Copy-Item "$($x64dir.FullName)\opengl32.dll" "C:\Windows\System32\" -Force
+              Copy-Item "$($x64dir.FullName)\*.dll" "C:\Windows\System32\" -Force -ErrorAction SilentlyContinue
+            }
+          }
+          
+          # Verificar OpenGL disponible
+          $openglDll = Test-Path "C:\Windows\System32\opengl32.dll"
+          Write-Host "OpenGL DLL present: $openglDll"
+          
+          # Instalar Visual C++ Redistributable (necesario para muchas apps)
+          $vcUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+          Invoke-WebRequest -Uri $vcUrl -OutFile "$env:TEMP\vc_redist.x64.exe" -UseBasicParsing
+          Start-Process "$env:TEMP\vc_redist.x64.exe" -ArgumentList "/quiet", "/norestart" -Wait
+          
+          Write-Host "Mesa3D (software OpenGL) installed successfully"
+
+      # ─────────────────────────────────────────────
+      # 3. CONFIGURAR RDP
+      # ─────────────────────────────────────────────
+      - name: Configure RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          # Firewall rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configured."
+
+      # ─────────────────────────────────────────────
+      # 4. CREAR USUARIO RDP
+      # ─────────────────────────────────────────────
+      - name: Create RDP User
+        run: |
+          $charSet = @{
+            Upper   = [char[]](65..90)
+            Lower   = [char[]](97..122)
+            Number  = [char[]](48..57)
+            Special = [char[]]@(33,35,36,37,38,42,43,45,61,64)
+          }
+          $rawPassword  = @()
+          $rawPassword += $charSet.Upper   | Get-Random -Count 4
+          $rawPassword += $charSet.Lower   | Get-Random -Count 4
+          $rawPassword += $charSet.Number  | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators"        -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users"  -Member "RDP" -ErrorAction SilentlyContinue
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            Write-Error "User creation failed"; exit 1
+          }
+
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "RDP user created."
+
+      # ─────────────────────────────────────────────
+      # 5. INSTALAR TAILSCALE
+      # ─────────────────────────────────────────────
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i","`"$installer`"","/quiet","/norestart" -Wait
+          Remove-Item $installer -Force
+
+      # ─────────────────────────────────────────────
+      # 6. CONECTAR TAILSCALE
+      # ─────────────────────────────────────────────
+      - name: Connect Tailscale
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 15) {
+            Start-Sleep -Seconds 4
+            $tsIP = & $ts ip -4 2>$null
+            $retries++
+          }
+
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
+
+      # ─────────────────────────────────────────────
+      # 7. VERIFICAR RDP
+      # ─────────────────────────────────────────────
+      - name: Verify RDP
+        run: |
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) {
+            Write-Error "RDP port 3389 not reachable"; exit 1
+          }
+          Write-Host "RDP reachable on port 3389 ✓"
+
+      # ─────────────────────────────────────────────
+      # 8. MANTENER SESIÓN ACTIVA
+      # ─────────────────────────────────────────────
+      - name: Keep Alive & Show Credentials
+        run: |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════╗"
+          Write-Host "║         RDP ACCESS INFO              ║"
+          Write-Host "╠══════════════════════════════════════╣"
+          Write-Host "║  IP:       $env:TAILSCALE_IP"
+          Write-Host "║  User:     RDP"
+          Write-Host "║  Password: $env:RDP_PASSWORD"
+          Write-Host "╠══════════════════════════════════════╣"
+          Write-Host "║  STORAGE                             ║"
+          Write-Host "║  C: ~14GB (sistema)                  ║"
+          Write-Host "║  D: ~70GB (runner disk)              ║"
+          Write-Host "║  E: ~100GB (VHD extra)               ║"
+          Write-Host "╠══════════════════════════════════════╣"
+          Write-Host "║  GPU: Mesa3D Software OpenGL 3.x     ║"
+          Write-Host "║  (permite Minecraft, VSCode, etc.)   ║"
+          Write-Host "╚══════════════════════════════════════╝"
+          Write-Host ""
+
+          # Ping de vida cada 5 min
+          $i = 0
+          while ($true) {
+            $i++
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active — tick $i"
+            Get-PSDrive -PSProvider FileSystem | Select-Object Name,
+              @{N='Free(GB)';E={[math]::Round($_.Free/1GB,1)}} | Format-Table -AutoSize
+            Start-Sleep -Seconds 300
+          }
